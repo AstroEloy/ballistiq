@@ -55,3 +55,21 @@ jobs:
           python -m pytest
         env:
           QT_QPA_PLATFORM: offscreen
+      # Capturas con el sistema gráfico real: las pruebas se ejecutan sin pantalla
+      - name: Captura de la ventana (Windows)
+        if: always() && runner.os == 'Windows' && matrix.python == '3.12'
+        continue-on-error: true
+        run: python tests/capture_window.py capturas/${{ matrix.os }}
+      - name: Captura de la ventana (Linux)
+        if: always() && runner.os == 'Linux' && matrix.python == '3.12'
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y xvfb
+          xvfb-run -a python tests/capture_window.py capturas/${{ matrix.os }}
+      - name: Guardar las capturas
+        if: always() && matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: captura-${{ matrix.os }}
+          path: capturas/
+          if-no-files-found: warn

@@ -8,6 +8,8 @@ dist/
 *.egg-info/
 .DS_Store
 
+capturas/
+
 # Datos de trabajo: los vídeos y los Excel exportados no van al repositorio
 *.xlsx
 *.mp4

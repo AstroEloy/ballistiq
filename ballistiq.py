@@ -44,7 +44,7 @@ except ImportError as qt6_error:
     except ImportError:
         raise qt6_error
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 PREDICTED_FRAMES = 5   # cuántos frames futuros se predicen
 FIT_POINTS = 5         # con cuántos puntos recientes se calcula la predicción
@@ -54,7 +54,6 @@ ZOOM_MIN, ZOOM_MAX = 0.02, 64.0
 MIN_EXPORT_POINTS = 2
 PANEL_WIDTH, PANEL_MARGIN = 270, 14
 PANEL_TEXT_WIDTH = PANEL_WIDTH - 2 * PANEL_MARGIN - 20   # con sitio para su barra de desplazamiento
-NOTICE_MS = 10000      # cuánto se muestra un aviso, en milisegundos
 RELEASE, IMPACT = 0, 1     # posición de cada anotación en MainWindow.ticks
 
 POINT_COLOR = QColor("#ff3b30")
@@ -699,7 +698,6 @@ class MainWindow(QMainWindow):
 
         self._nav_timer = QTimer(self, singleShot=True, interval=0)
         self._nav_timer.timeout.connect(self._show_target)
-        self._notice_timer = QTimer(self, singleShot=True, interval=NOTICE_MS)
 
         self.setWindowTitle(f"Ballistiq · {self.path.name}")
         self.view = VideoView(reader.width, reader.height)
@@ -870,6 +868,9 @@ class MainWindow(QMainWindow):
         self._on_hover(None)
         column.addWidget(self.hover_label)
         self.point_label = QLabel()
+        # Su texto cambia sin parar: no debe poder ensanchar el panel y mover la ventana.
+        for label in (self.hover_label, self.point_label):
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.count_label = QLabel()
         column.addWidget(self.point_label)
         column.addWidget(self.count_label)
@@ -897,13 +898,12 @@ class MainWindow(QMainWindow):
         export_button = self._button("Exportar a Excel", self._export)
         export_button.setObjectName("export")
         column.addWidget(export_button)
-        # Con su hueco reservado siempre, para que un aviso no mueva nada de la ventana.
+        # Con su hueco reservado siempre, para que el aviso no mueva nada de la ventana.
         self.notice_label = QLabel()
         self.notice_label.setProperty("role", "hint")
-        self.notice_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.notice_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.notice_label.ensurePolished()
         self.notice_label.setFixedHeight(self.notice_label.fontMetrics().height() + 2)
-        self._notice_timer.timeout.connect(self.notice_label.clear)
         column.addWidget(self.notice_label)
 
         column.addStretch(1)
@@ -938,8 +938,8 @@ class MainWindow(QMainWindow):
     def _show_target(self):
         image = self.reader.frame(self._target)
         if image is None:
-            self._notify(f"No se pudo leer el frame {self._target}")
-            self._target = self.frame
+            failed, self._target = self._target, self.frame
+            QMessageBox.warning(self, "Ballistiq", f"No se pudo leer el frame {failed}.")
         else:
             self.frame = self._target
             lut = self.levels.lut()
@@ -965,21 +965,14 @@ class MainWindow(QMainWindow):
 
         if self.frame in self.points:
             x, y = self._output_xy(*self.points[self.frame])
-            self.point_label.setText(f"Este frame: x = {x:.2f}, y = {y:.2f}")
+            self.point_label.setText(f"Punto: x = {x:.2f}, y = {y:.2f}")
         else:
-            self.point_label.setText("Este frame: sin punto")
+            self.point_label.setText("Punto: sin marcar")
         self.count_label.setText(f"Marcados: {len(self.points)}")
 
         predicted = predict(self.points, self.frame, self.reader.count - 1)
         line = fit_line(self.points, self.reader.width, self.reader.height)
         self.view.set_overlay(self.points, self.frame, predicted, line)
-
-    def _notify(self, text):
-        label = self.notice_label
-        label.setText(label.fontMetrics().elidedText(text, Qt.TextElideMode.ElideMiddle,
-                                                     PANEL_TEXT_WIDTH))
-        label.setToolTip(text)
-        self._notice_timer.start()
 
     def _on_hover(self, point):
         if point is None:
@@ -990,15 +983,25 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------- puntos y anotaciones
 
+    def _mark_changed(self):
+        """Hay cambios sin exportar: el aviso de exportado deja de ser cierto."""
+        self.dirty = True
+        self.notice_label.clear()
+
+    def _settings_changed(self):
+        """Rotación, tamaño o FPS: cambian lo que se exportaría, si ya hay puntos."""
+        if self.points:
+            self._mark_changed()
+
     def _on_left_click(self, x, y):
         self.points[self.frame] = (x, y)
-        self.dirty = True
+        self._mark_changed()
         self._refresh()
 
     def _on_right_click(self):
         if self.points.pop(self.frame, None) is not None:
             self.ticks = [None if tick == self.frame else tick for tick in self.ticks]
-            self.dirty = True
+            self._mark_changed()
             self._refresh()
 
     def _tick_available(self, which):
@@ -1014,7 +1017,7 @@ class MainWindow(QMainWindow):
 
     def _on_tick(self, which, checked):
         self.ticks[which] = self.frame if checked else None
-        self.dirty = True
+        self._mark_changed()
         self._refresh()
 
     # ------------------------------------------------------- vista y metadatos
@@ -1037,15 +1040,18 @@ class MainWindow(QMainWindow):
             field.blockSignals(False)
         self.rotate_button.setText(f"Rotar 90° (ahora {self.rotation}°)"
                                    if self.rotation else "Rotar 90°")
+        self._settings_changed()
         self._apply_geometry()
 
     def _on_size_edited(self):
         w, h = self.width_field.value(), self.height_field.value()
         self.size_unrotated = (h, w) if self.rotation in (90, 270) else (w, h)
+        self._settings_changed()
         self._apply_geometry()
 
     def _on_fps_edited(self, value):
         self.fps = value
+        self._settings_changed()
         self._refresh()
 
     def _output_xy(self, x, y):
@@ -1108,7 +1114,7 @@ class MainWindow(QMainWindow):
                                  f"¿Está abierto en Excel?\n\n{error}")
             return
         self.dirty = False
-        self._notify(f"Exportado: {target.name}")
+        self.notice_label.setText("¡Exportado!")
 
     def closeEvent(self, event):
         if self.dirty:

@@ -1006,13 +1006,147 @@ def test_el_aviso_de_exportar_no_mueve_nada_de_la_ventana(window):
     before = [w.geometry() for w in widgets]
     window._export()
     pump()
-    assert window.notice_label.text() == "Exportado: disparo_01.xlsx"
+    assert window.notice_label.text() == "¡Exportado!"
+    assert window.notice_label.alignment() & Qt.AlignmentFlag.AlignHCenter
     assert [w.geometry() for w in widgets] == before
     assert window.findChild(QStatusBar) is None
-    window._notice_timer.timeout.emit()      # al desaparecer tampoco
-    pump()
+    mark_points(window, 2)                   # al desaparecer tampoco
     assert window.notice_label.text() == ""
     assert [w.geometry() for w in widgets] == before
+
+
+def test_las_coordenadas_no_cambian_el_ancho_del_panel(window):
+    panel = window.notice_label.parent()
+    width = panel.width()
+    mark_points(window, 0, 1)
+    assert window.point_label.text().startswith("Punto: x = ")
+    assert panel.width() == width
+    window.point_label.setText("Punto: x = 12345.67, y = 12345.67, " * 3)
+    window.hover_label.setText("Ratón: x = 12345.67, y = 12345.67, " * 3)
+    pump()
+    assert panel.width() == width
+    go(window, 50)
+    assert window.point_label.text() == "Punto: sin marcar"
+    assert panel.width() == width
+
+
+def test_antes_de_exportar_no_hay_aviso(window):
+    mark_points(window, 0, 1)
+    assert window.notice_label.text() == ""
+
+
+def test_exportado_se_mantiene_si_no_cambia_ningun_punto(window):
+    view = window.view
+    mark_points(window, 0, 1)
+    window._export()
+    go(window, 50)
+    press(window, Qt.Key.Key_Right)
+    wheel(view, view.viewport().rect().center())
+    hover(view, view.viewport().rect().center())
+    window.levels.white = 100
+    window.levels.changed.emit()
+    tick_click(window.guides_box)
+    pump()
+    assert window.notice_label.text() == "¡Exportado!"
+    assert not window.dirty
+
+
+def _add_point(window):
+    go(window, 5)
+    click(window, 30, 30)
+
+
+def _move_point(window):
+    go(window, 0)
+    click(window, 40, 40)
+
+
+def _remove_point(window):
+    go(window, 0)
+    click(window, 5, 5, Qt.MouseButton.RightButton)
+
+
+def _annotate(window):
+    go(window, 0)
+    tick_click(window.tick_boxes[0])
+
+
+def _rotate_view(window):
+    window._rotate()
+
+
+def _edit_width(window):
+    window.width_field.setValue(WIDTH * 2)
+
+
+def _edit_height(window):
+    window.height_field.setValue(HEIGHT * 2)
+
+
+def _edit_fps(window):
+    window.fps_field.setValue(1000)
+
+
+SETTINGS_CHANGES = [_rotate_view, _edit_width, _edit_height, _edit_fps]
+
+
+@pytest.mark.parametrize("change", [_add_point, _move_point, _remove_point, _annotate] + SETTINGS_CHANGES)
+def test_exportado_desaparece_si_cambia_algo_que_va_en_el_excel(window, change):
+    mark_points(window, 0, 1)
+    window._export()
+    assert window.notice_label.text() == "¡Exportado!"
+    change(window)
+    pump()
+    assert window.notice_label.text() == ""
+    assert window.dirty
+
+
+@pytest.mark.parametrize("change", SETTINGS_CHANGES)
+def test_sin_puntos_rotar_o_editar_no_deja_cambios_sin_exportar(window, change):
+    change(window)
+    pump()
+    assert not window.dirty
+
+
+def test_tras_cambiar_el_ancho_hay_que_volver_a_exportar_y_el_excel_cambia(window, dialogs):
+    mark_points(window, 0, 1)
+    output = exported(window)
+    before = sheet_rows(output)[1]
+    _edit_width(window)
+    pump()
+    dialogs.answers[:] = [QMessageBox.StandardButton.Yes]
+    window._export()
+    assert window.notice_label.text() == "¡Exportado!"
+    after = sheet_rows(output)[1]
+    assert after[1] == pytest.approx(before[1] * 2, abs=0.02)
+    assert after[2] == before[2]
+
+
+def test_clic_derecho_sin_punto_no_quita_exportado(window):
+    mark_points(window, 0, 1)
+    window._export()
+    go(window, 7)
+    click(window, 5, 5, Qt.MouseButton.RightButton)
+    assert window.notice_label.text() == "¡Exportado!"
+    assert not window.dirty
+
+
+def test_volver_a_exportar_lo_muestra_de_nuevo(window, dialogs):
+    mark_points(window, 0, 1)
+    window._export()
+    mark_points(window, 2)
+    dialogs.answers[:] = [QMessageBox.StandardButton.Yes]
+    window._export()
+    assert window.notice_label.text() == "¡Exportado!"
+
+
+def test_si_no_se_puede_leer_un_frame_avisa_y_se_queda_donde_estaba(window, dialogs, monkeypatch):
+    go(window, 3)
+    read = window.reader.frame
+    monkeypatch.setattr(window.reader, "frame", lambda k: None if k == 9 else read(k))
+    go(window, 9)
+    assert "No se pudo leer el frame 9" in dialogs.shown[-1]
+    assert window.frame == 3 and window.slider.value() == 3
 
 
 def test_la_ventana_cabe_en_pantallas_pequenas(window):
@@ -1028,15 +1162,6 @@ def test_la_ventana_cabe_en_pantallas_pequenas(window):
     assert area.verticalScrollBar().maximum() > 0
     assert panel.width() == area.viewport().width()
     assert panel.minimumSizeHint().width() <= panel.width()
-
-
-def test_un_aviso_largo_no_ensancha_el_panel(window):
-    panel_width = window.notice_label.parent().width()
-    window._notify("Exportado: " + "nombre_muy_largo_" * 20 + ".xlsx")
-    pump()
-    assert window.notice_label.parent().width() == panel_width
-    assert "…" in window.notice_label.text()
-    assert "nombre_muy_largo_" * 20 in window.notice_label.toolTip()
 
 
 def test_exporta_frame_posicion_y_evento_junto_al_video_con_su_nombre(window):
@@ -1152,6 +1277,7 @@ def test_fallo_al_guardar_avisa_y_conserva_los_cambios(window, dialogs, monkeypa
     window._export()
     assert "bloqueado" in dialogs.shown[-1]
     assert window.dirty
+    assert window.notice_label.text() == ""
 
 
 def test_exporta_coordenadas_rotadas(window):

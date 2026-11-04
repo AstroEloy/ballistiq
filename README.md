@@ -87,7 +87,8 @@ variable, la ventana te avisa.
 El botón **Exportar a Excel** guarda un `.xlsx` en la misma carpeta que el vídeo que
 has abierto; la ventana te muestra cuál es. Hacen falta al menos 2 puntos. Por defecto
 se llama como el vídeo, pero puedes escribir otro nombre. Si ya existe, pregunta antes
-de reemplazarlo.
+de reemplazarlo. Al terminar aparece «¡Exportado!» bajo el botón, hasta que cambies algo
+que afecte al Excel: un punto, una anotación, la rotación, el ancho, el alto o el FPS.
 
 La hoja **Puntos** tiene una fila por punto:
 

@@ -677,6 +677,27 @@ def test_nombre_vacio_usa_el_del_video(window):
     assert exported(window).exists()
 
 
+def test_rutas_con_acentos_y_espacios(qapp, video, tmp_path, dialogs):
+    folder = tmp_path / "Mis vídeos de cañón ñ"
+    folder.mkdir()
+    copy = folder / "disparo número 1.mp4"
+    copy.write_bytes(video.read_bytes())
+    win = MainWindow(VideoReader(copy), copy)
+    win.show()
+    pump()
+    try:
+        assert frame_number(win.reader.frame(50)) == 50
+        assert win.name_field.text() == "disparo número 1"
+        assert win.folder_label.toolTip() == str(folder.resolve())
+        mark_points(win, 0, 1)
+        output = exported(win, "disparo número 1")
+        assert output.parent == folder and output.exists()
+        assert sheet_rows(output)[0] == ("frame", "x", "y", "marca")
+    finally:
+        win.dirty = False
+        win.close()
+
+
 def test_no_permite_guardar_fuera_de_la_carpeta(window, dialogs):
     mark_points(window, 0, 1)
     window.name_field.setText("../fuera")

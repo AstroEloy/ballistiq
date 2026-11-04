@@ -68,8 +68,9 @@ def test_comando_de_windows_funciona_con_usuarios_con_acentos(tmp_path, monkeypa
     monkeypatch.setenv("PATH", str(tmp_path / "Microsoft" / "WindowsApps"))
     assert install.create_command() == "Para empezar escribe:  ballistiq"
     shim = tmp_path / "Microsoft" / "WindowsApps" / "ballistiq.cmd"
-    assert shim.read_bytes().decode("ascii") == (
-        '@"%USERPROFILE%\\.ballistiq\\venv\\Scripts\\ballistiq.exe" %*\n')
+    # strip: en Windows real la línea acaba en \r\n, lo normal en un .cmd
+    assert shim.read_bytes().decode("ascii").strip() == (
+        '@"%USERPROFILE%\\.ballistiq\\venv\\Scripts\\ballistiq.exe" %*')
 
 
 def test_windows_busca_otro_python_con_el_lanzador(monkeypatch, commands):

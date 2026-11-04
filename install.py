@@ -148,8 +148,9 @@ def qt_problem():
     if LINUX and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         environments.append({k: v for k, v in os.environ.items() if k != "QT_QPA_PLATFORM"})
     for environment in environments:
+        # Desde otra carpeta, para comprobar la copia instalada y no la del repositorio.
         result = subprocess.run([str(PYTHON), "-c", "import ballistiq; ballistiq.QApplication([])"],
-                                env=environment, capture_output=True, text=True)
+                                env=environment, cwd=str(HOME), capture_output=True, text=True)
         if result.returncode != 0:
             return result.stderr.strip() or f"código de salida {result.returncode}"
     return None

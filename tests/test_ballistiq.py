@@ -1,5 +1,6 @@
 """Pruebas sobre la ventana real, con clics y teclas simulados y vídeos generados al vuelo."""
 
+import math
 import os
 import random
 from fractions import Fraction
@@ -14,7 +15,7 @@ import pytest
 
 import ballistiq as app_module
 from ballistiq import (MainWindow, QApplication, QImage, QMessageBox, QPointF, Qt, VideoReader,
-                       predict)
+                       fit_line, predict)
 
 # Las clases que solo usan las pruebas, de la misma librería de Qt que use el programa
 _binding = Qt.__module__.split(".")[0]
@@ -23,6 +24,7 @@ QPoint = import_module(_binding + ".QtCore").QPoint
 QMouseEvent = import_module(_binding + ".QtGui").QMouseEvent
 QWheelEvent = import_module(_binding + ".QtGui").QWheelEvent
 QTest = import_module(_binding + ".QtTest").QTest
+QStatusBar = import_module(_binding + ".QtWidgets").QStatusBar
 
 WIDTH, HEIGHT, FRAMES = 640, 360, 120
 BALL_COLOR = (240, 200, 40)
@@ -78,7 +80,7 @@ def slow_motion_section(i):
 @pytest.fixture(scope="session")
 def qapp():
     application = QApplication.instance() or QApplication([])
-    application.setStyle("Fusion")
+    app_module.apply_style(application)   # el mismo aspecto que el programa real
     return application
 
 
@@ -116,6 +118,7 @@ def window(qapp, video, tmp_path, dialogs):
     copy = tmp_path / video.name
     copy.write_bytes(video.read_bytes())
     win = MainWindow(VideoReader(copy), copy)
+    win.resize(1200, 760)     # tamaño fijo: la ventana se adapta a la pantalla, que aquí es virtual
     win.show()
     QTest.qWaitForWindowActive(win, 1000)
     pump()
@@ -135,6 +138,15 @@ def click(win, x, y, button=Qt.MouseButton.LeftButton):
     pump()
 
 
+def pixels(points):
+    """Píxel en el que cae cada punto: un clic en pantalla no da un valor exacto de la imagen."""
+    return {frame: (math.floor(x), math.floor(y)) for frame, (x, y) in points.items()}
+
+
+def floored(row):
+    return (row[0], math.floor(row[1]), math.floor(row[2])) + tuple(row[3:])
+
+
 def press(win, key):
     QTest.keyClick(win.view, key)
     pump()
@@ -145,14 +157,27 @@ def go(win, k):
     pump()
 
 
-def drag(widget, button, start, end):
+def drag(widget, button, start, end, modifier=Qt.KeyboardModifier.NoModifier):
     """Pulsa, mueve con el botón pulsado y suelta, con los eventos que manda el sistema."""
-    QTest.mousePress(widget, button, Qt.KeyboardModifier.NoModifier, start)
+    QTest.mousePress(widget, button, modifier, start)
     move = QMouseEvent(QEvent.Type.MouseMove, QPointF(end), QPointF(widget.mapToGlobal(end)),
-                       Qt.MouseButton.NoButton, button, Qt.KeyboardModifier.NoModifier)
+                       Qt.MouseButton.NoButton, button, modifier)
     QApplication.sendEvent(widget, move)
-    QTest.mouseRelease(widget, button, Qt.KeyboardModifier.NoModifier, end)
+    QTest.mouseRelease(widget, button, modifier, end)
     pump()
+
+
+def wheel(view, position, delta=120):
+    viewport = view.viewport()
+    event = QWheelEvent(QPointF(position), QPointF(viewport.mapToGlobal(position)), QPoint(0, 0),
+                        QPoint(0, delta), Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                        Qt.ScrollPhase.NoScrollPhase, False)
+    QApplication.sendEvent(viewport, event)
+    pump()
+
+
+def distance(a, b):
+    return abs(a.x() - b.x()) + abs(a.y() - b.y())
 
 
 def tick_click(box):
@@ -247,6 +272,233 @@ def test_prediccion_usa_los_ultimos_puntos_e_ignora_los_futuros():
     assert predict({0: (0, 0), 1: (10, 0), 20: (5000, 0)}, 1, 99)[0][1] == pytest.approx(20)
 
 
+# ------------------------------------------------------------------- recta de ajuste
+
+def test_recta_necesita_dos_puntos_distintos():
+    assert fit_line({}, 100, 100) is None
+    assert fit_line({0: (5, 5)}, 100, 100) is None
+    assert fit_line({0: (5, 5), 1: (5, 5), 2: (5, 5)}, 100, 100) is None
+
+
+def on_line(line, point):
+    (ax, ay), (bx, by) = line
+    px, py = point
+    return abs((bx - ax) * (py - ay) - (by - ay) * (px - ax)) / np.hypot(bx - ax, by - ay)
+
+
+@pytest.mark.parametrize("points", [
+    {0: (10, 50), 1: (20, 50), 2: (30, 50)},        # horizontal
+    {0: (50, 10), 1: (50, 20), 2: (50, 30)},        # vertical: un ajuste y(x) fallaría aquí
+    {0: (10, 10), 1: (20, 20), 2: (40, 40)},        # diagonal
+    {0: (10, 90), 1: (30, 70)},                     # solo dos puntos
+])
+def test_recta_pasa_por_puntos_alineados_y_llega_a_los_bordes(points):
+    line = fit_line(points, 100, 100)
+    assert all(on_line(line, p) < 1e-9 for p in points.values())
+    for end in line:
+        assert min(end[0], end[1], 100 - end[0], 100 - end[1]) == pytest.approx(0, abs=1e-9)
+        assert all(0 - 1e-9 <= value <= 100 + 1e-9 for value in end)
+
+
+def test_recta_ajusta_a_todos_los_puntos_y_no_solo_a_los_ultimos():
+    # Sube y baja alrededor de y = 50: el ajuste es horizontal aunque el final suba
+    points = {i: (10 + i * 10, 50 + (5 if i % 2 else -5)) for i in range(8)}
+    (ax, ay), (bx, by) = fit_line(points, 200, 100)
+    assert abs((by - ay) / (bx - ax)) < 0.1
+    assert abs(ay - 50.5) < 5
+
+
+def test_recta_es_la_que_menos_distancia_deja():
+    random.seed(4)
+    points = {i: (i * 4 + random.randint(-2, 2), i * 2 + 10 + random.randint(-2, 2)) for i in range(40)}
+    line = fit_line(points, 400, 400)
+    best = sum(on_line(line, p) ** 2 for p in points.values())
+    (ax, ay), (bx, by) = line
+    for dx, dy in ((0, 5), (5, 0), (0, -5), (-5, 0)):
+        other = ((ax + dx, ay + dy), (bx - dx, by - dy))
+        assert sum(on_line(other, p) ** 2 for p in points.values()) > best
+
+
+def test_la_recta_usa_todos_los_puntos_en_cualquier_frame(window):
+    mark_points(window, 5, 10, 40)
+    go(window, 5)
+    first_view = window.view._fit_line
+    go(window, 100)
+    assert window.view._fit_line == first_view == fit_line(window.points, WIDTH, HEIGHT)
+
+
+def color_near(image, position, wanted, radius=3):
+    x, y = position.x(), position.y()
+    area = image[y - radius:y + radius + 1, x - radius:x + radius + 1].astype(int)
+    return np.abs(area - wanted).sum(axis=2).min()
+
+
+def test_la_recta_se_pinta_de_borde_a_borde_y_al_fondo(window):
+    view = window.view
+    click(window, 100, 100)
+    go(window, 1)
+    click(window, 200, 200)
+    pump()
+    yellow = (0xff, 0xd6, 0x0a)
+    image = as_rgb(view.viewport().grab().toImage())
+    # Antes y después de los puntos solo está la recta. La predicción acaba en (300, 300):
+    # la siguiente, en (400, 400), ya cae fuera de la imagen.
+    for beyond in ((50.5, 50.5), (340.5, 340.5)):
+        assert color_near(image, view.mapFromScene(QPointF(*beyond)), yellow) < 60
+    between = view.mapFromScene(QPointF(150.5, 150.5))    # entre puntos: la línea roja va encima
+    assert color_near(image, between, (0xff, 0x3b, 0x30)) < 60
+    assert color_near(image, between, yellow) > 100
+
+
+def test_sin_puntos_suficientes_no_hay_recta(window):
+    click(window, 100, 100)
+    assert window.view._fit_line is None
+    go(window, 1)
+    click(window, 200, 200)
+    assert window.view._fit_line is not None
+    click(window, 200, 200, Qt.MouseButton.RightButton)
+    assert window.view._fit_line is None
+
+
+# ---------------------------------------------------------------------- líneas guía
+
+YELLOW, RED, CYAN = (0xff, 0xd6, 0x0a), (0xff, 0x3b, 0x30), (0x00, 0xd1, 0xff)
+
+
+def guides_image(window):
+    click(window, 100, 100)
+    go(window, 1)
+    click(window, 200, 200)
+    pump()
+    return as_rgb(window.view.viewport().grab().toImage())
+
+
+def test_la_casilla_de_guias_empieza_activada_y_las_muestra(window):
+    assert window.guides_box.isChecked()
+    image = guides_image(window)
+    view = window.view
+    assert color_near(image, view.mapFromScene(QPointF(50.5, 50.5)), YELLOW) < 60      # recta
+    assert color_near(image, view.mapFromScene(QPointF(150.5, 150.5)), RED) < 60       # línea roja
+    assert color_near(image, view.mapFromScene(QPointF(300.5, 300.5)), CYAN) < 60      # predicción
+
+
+def test_desactivar_las_guias_las_oculta_pero_no_los_puntos(window):
+    guides_image(window)
+    view = window.view
+    tick_click(window.guides_box)
+    assert not window.guides_box.isChecked()
+    image = as_rgb(view.viewport().grab().toImage())
+    assert color_near(image, view.mapFromScene(QPointF(50.5, 50.5)), YELLOW) > 200
+    assert color_near(image, view.mapFromScene(QPointF(150.5, 150.5)), RED) > 200
+    assert color_near(image, view.mapFromScene(QPointF(300.5, 300.5)), CYAN) > 200
+    assert color_near(image, view.mapFromScene(QPointF(100.5, 100.5)), RED) < 60       # el punto
+
+
+def test_las_guias_ocultas_siguen_asi_al_cambiar_de_frame_y_se_pueden_recuperar(window):
+    guides_image(window)
+    view = window.view
+    tick_click(window.guides_box)
+    go(window, 2)
+    press(window, Qt.Key.Key_Right)
+    click(window, 250, 250)
+    image = as_rgb(view.viewport().grab().toImage())
+    assert color_near(image, view.mapFromScene(QPointF(50.5, 50.5)), YELLOW) > 200
+    tick_click(window.guides_box)
+    image = as_rgb(view.viewport().grab().toImage())
+    assert color_near(image, view.mapFromScene(QPointF(50.5, 50.5)), YELLOW) < 60
+
+
+def test_ocultar_las_guias_no_cambia_lo_que_se_exporta(window):
+    guides_image(window)
+    expected = sheet_rows(exported(window))
+    tick_click(window.guides_box)
+    assert pixels(window.points) == {0: (100, 100), 1: (200, 200)}
+    window.name_field.setText("sin_guias")
+    assert sheet_rows(exported(window, "sin_guias")) == expected
+
+
+def test_las_casillas_se_ven_aunque_esten_sin_marcar(window):
+    # El borde debe distinguirse del fondo claro del panel, también desactivada
+    for box, darkest_allowed in ((window.guides_box, 170), (window.tick_boxes[0], 215)):
+        if box is window.guides_box:
+            tick_click(box)
+        assert not box.isChecked()
+        image = as_rgb(box.grab().toImage())
+        ratio = image.shape[1] / box.width()
+        indicator = image[:, :int(18 * ratio)]
+        assert indicator.mean(axis=2).min() < darkest_allowed
+
+
+def test_la_casilla_de_guias_no_quita_las_flechas(window):
+    tick_click(window.guides_box)
+    press(window, Qt.Key.Key_Right)
+    assert window.frame == 1
+    assert not window.guides_box.hasFocus()
+
+
+# ------------------------------------------------------------------ posición del ratón
+
+def hover(view, position):
+    viewport = view.viewport()
+    event = QMouseEvent(QEvent.Type.MouseMove, QPointF(position), QPointF(viewport.mapToGlobal(QPointF(position).toPoint())),
+                        Qt.MouseButton.NoButton, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier)
+    QApplication.sendEvent(viewport, event)
+    pump()
+
+
+def test_el_ratón_se_sigue_sin_pulsar_nada(window):
+    assert window.view.viewport().hasMouseTracking()
+
+
+def test_muestra_la_posicion_del_raton_con_decimales(window):
+    view = window.view
+    for _ in range(8):
+        wheel(view, view.viewport().rect().center())
+    position = QPointF(view.viewport().rect().center()) + QPointF(0.25, 0.75)
+    hover(view, position)
+    point = view._image_point_at(position)
+    assert window.hover_label.text() == f"Ratón: x = {point.x():.2f}, y = {point.y():.2f}"
+    assert point.x() != int(point.x())
+
+
+@pytest.mark.parametrize("turns", [0, 1, 2, 3])
+def test_se_exporta_lo_que_muestra_el_raton(window, turns):
+    view = window.view
+    for _ in range(turns):
+        window._rotate()
+    pump()
+    for scene in ((100.3, 200.6), (333.7, 40.2), (620.5, 351.1)):
+        position = view.mapFromScene(QPointF(*scene))
+        hover(view, position)
+        text = window.hover_label.text()
+        x, y = (float(part.split("=")[1]) for part in text.replace("Ratón:", "").split(","))
+        QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, position)
+        pump()
+        assert window._output_xy(*window.points[0]) == pytest.approx((x, y), abs=0.011)
+
+
+def test_fuera_de_la_imagen_lo_indica(window):
+    view = window.view
+    view.zoom_by(0.3)
+    pump()
+    hover(view, QPoint(2, 2))
+    assert window.hover_label.text() == "Ratón: fuera de la imagen"
+    hover(view, view.viewport().rect().center())
+    assert window.hover_label.text().startswith("Ratón: x = ")
+    QApplication.sendEvent(view, QEvent(QEvent.Type.Leave))
+    pump()
+    assert window.hover_label.text() == "Ratón: fuera de la imagen"
+
+
+def test_hacer_zoom_actualiza_la_posicion_del_raton(window):
+    view = window.view
+    position = view.viewport().rect().center()
+    hover(view, position)
+    wheel(view, position)
+    point = view._image_point_at(position)
+    assert window.hover_label.text() == f"Ratón: x = {point.x():.2f}, y = {point.y():.2f}"
+
+
 # ----------------------------------------------------------------------- metadatos
 
 def test_lee_metadatos_y_nombre(window):
@@ -260,8 +512,9 @@ def test_ancho_editado_escala_las_coordenadas_sin_tocar_el_punto(window):
     click(window, 320, 100)
     window.width_field.setValue(WIDTH * 2)
     pump()
-    assert window._output_xy(*window.points[0]) == (641, 100)
-    assert window.points[0] == (320, 100)
+    x, y = window.points[0]
+    assert pixels(window.points)[0] == (320, 100)
+    assert window._output_xy(x, y) == (round(x * 2, 2), round(y, 2))
 
 
 def test_alto_editado_con_rotacion_va_al_eje_correcto(window):
@@ -313,9 +566,9 @@ def test_escribir_el_numero_de_frame(window):
 
 def test_un_solo_punto_por_frame_y_clic_derecho_lo_quita(window):
     click(window, 100, 200)
-    assert window.points == {0: (100, 200)}
+    assert pixels(window.points) == {0: (100, 200)}
     click(window, 110, 210)
-    assert window.points == {0: (110, 210)}
+    assert pixels(window.points) == {0: (110, 210)}
     click(window, 5, 5, Qt.MouseButton.RightButton)
     assert window.points == {}
     click(window, 5, 5, Qt.MouseButton.RightButton)
@@ -326,9 +579,9 @@ def test_los_puntos_de_otros_frames_no_se_editan(window):
     click(window, 100, 200)
     press(window, Qt.Key.Key_Right)
     click(window, 300, 300, Qt.MouseButton.RightButton)
-    assert window.points == {0: (100, 200)}
+    assert pixels(window.points) == {0: (100, 200)}
     click(window, 120, 220)
-    assert window.points == {0: (100, 200), 1: (120, 220)}
+    assert pixels(window.points) == {0: (100, 200), 1: (120, 220)}
 
 
 def test_al_volver_a_su_frame_se_puede_editar(window):
@@ -337,9 +590,9 @@ def test_al_volver_a_su_frame_se_puede_editar(window):
     click(window, 120, 220)
     press(window, Qt.Key.Key_Left)
     click(window, 90, 190)
-    assert window.points == {0: (90, 190), 1: (120, 220)}
+    assert pixels(window.points) == {0: (90, 190), 1: (120, 220)}
     click(window, 90, 190, Qt.MouseButton.RightButton)
-    assert window.points == {1: (120, 220)}
+    assert pixels(window.points) == {1: (120, 220)}
 
 
 def test_dos_clics_rapidos_cuentan_como_dos_clics(window):
@@ -350,7 +603,7 @@ def test_dos_clics_rapidos_cuentan_como_dos_clics(window):
                                Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
     QApplication.sendEvent(viewport, second_click)
     pump()
-    assert window.points == {0: (150, 250)}
+    assert pixels(window.points) == {0: (150, 250)}
 
 
 def test_clic_fuera_de_la_imagen_se_ignora(window):
@@ -380,14 +633,100 @@ def test_el_zoom_se_mantiene_al_cambiar_de_frame(window):
 
 
 def test_rueda_hace_zoom(window):
-    viewport = window.view.viewport()
-    center = viewport.rect().center()
     before = window.view._zoom
-    event = QWheelEvent(QPointF(center), QPointF(viewport.mapToGlobal(center)), QPoint(0, 0),
-                        QPoint(0, 120), Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
-    QApplication.sendEvent(viewport, event)
-    pump()
+    wheel(window.view, window.view.viewport().rect().center())
     assert window.view._zoom / before == pytest.approx(1.0015 ** 120)
+
+
+@pytest.mark.parametrize("turns", [0, 1])
+@pytest.mark.parametrize("point", [(30, HEIGHT - 30), (WIDTH / 2, HEIGHT / 2), (WIDTH - 30, 30)])
+def test_el_zoom_sigue_al_cursor_al_acercar_y_alejar(window, point, turns):
+    view = window.view
+    for _ in range(turns):
+        window._rotate()
+    pump()
+    position = view.mapFromScene(QPointF(*point))
+    target = view.mapToScene(position)     # el punto exacto que hay bajo el cursor
+    for _ in range(15):
+        wheel(view, position)
+    assert view._zoom > 5
+    assert distance(view.mapFromScene(target), position) <= 2
+    for _ in range(15):
+        wheel(view, position, -120)
+    assert distance(view.mapFromScene(target), position) <= 2
+
+
+def test_el_zoom_no_se_desplaza_con_pasos_pequenos_de_trackpad(window):
+    view = window.view
+    position = view.mapFromScene(QPointF(100, 300))
+    target = view.mapToScene(position)
+    for _ in range(150):
+        wheel(view, position, 8)
+    assert view._zoom > 5
+    assert distance(view.mapFromScene(target), position) <= 2
+
+
+def test_mover_el_cursor_cambia_el_punto_del_zoom(window):
+    view = window.view
+    first = view.mapFromScene(QPointF(100, 100))
+    for _ in range(4):
+        wheel(view, first)
+    second = first + QPoint(150, 60)
+    target = QPointF(view.mapToScene(second))
+    for _ in range(4):
+        wheel(view, second)
+    assert distance(view.mapFromScene(target), second) <= 2
+
+
+def test_el_zoom_tras_arrastrar_usa_el_punto_nuevo(window):
+    view = window.view
+    position = view.viewport().rect().center()
+    for _ in range(4):
+        wheel(view, position)
+    drag(view.viewport(), Qt.MouseButton.MiddleButton, position, position + QPoint(80, 0))
+    target = QPointF(view.mapToScene(position))
+    for _ in range(4):
+        wheel(view, position)
+    assert distance(view.mapFromScene(target), position) <= 2
+
+
+def test_los_botones_de_zoom_mantienen_el_centro_de_la_pantalla(window):
+    view = window.view
+    middle = view._screen_center()
+    target = view._image_point_at(middle)
+    for _ in range(6):
+        view.zoom_by(app_module.ZOOM_STEP)
+    assert distance(view.viewportTransform().map(target), middle) <= 2
+
+
+def test_ajustar_vuelve_a_centrar_tras_mover(window):
+    view = window.view
+    middle = view.viewport().rect().center()
+    for _ in range(6):
+        wheel(view, middle + QPoint(200, 100))
+    view.fit()
+    pump()
+    assert distance(view.mapFromScene(QPointF(WIDTH / 2, HEIGHT / 2)), middle) <= 2
+
+
+def test_redimensionar_con_zoom_conserva_el_centro(window):
+    view = window.view
+    for _ in range(6):
+        view.zoom_by(app_module.ZOOM_STEP)
+    pump()
+    target = QPointF(view.mapToScene(view.viewport().rect().center()))
+    window.resize(window.width() - 200, window.height() - 100)
+    pump()
+    assert distance(view.mapFromScene(target), view.viewport().rect().center()) <= 2
+
+
+def test_la_imagen_no_se_puede_perder_arrastrando(window):
+    view = window.view
+    center = view.viewport().rect().center()
+    for _ in range(40):
+        drag(view.viewport(), Qt.MouseButton.MiddleButton, center, center + QPoint(300, 200))
+    image = view.mapFromScene(view.scene().items()[0].sceneBoundingRect()).boundingRect()
+    assert image.intersects(view.viewport().rect().adjusted(-2, -2, 2, 2))
 
 
 def test_desplazar_no_marca_puntos(window):
@@ -398,15 +737,45 @@ def test_desplazar_no_marca_puntos(window):
     pump()
     viewport, center = view.viewport(), view.viewport().rect().center()
 
-    def scrolled_by(button, delta):
+    def scrolled_by(button, delta, modifier=Qt.KeyboardModifier.NoModifier):
         before = view.horizontalScrollBar().value()
-        drag(viewport, button, center, center + QPoint(delta, 0))
+        drag(viewport, button, center, center + QPoint(delta, 0), modifier)
         return view.horizontalScrollBar().value() - before
 
+    # Rueda pulsada, Ctrl (o Command en Mac) y Control en Mac, que Qt entrega como Meta
     assert scrolled_by(Qt.MouseButton.MiddleButton, -40) == 40
-    view._space_held = True
-    assert scrolled_by(Qt.MouseButton.LeftButton, 30) == -30
-    view._space_held = False
+    assert scrolled_by(Qt.MouseButton.LeftButton, 30, Qt.KeyboardModifier.ControlModifier) == -30
+    assert scrolled_by(Qt.MouseButton.LeftButton, 20, Qt.KeyboardModifier.MetaModifier) == -20
+    # Espacio, con la tecla de verdad
+    QTest.keyPress(view, Qt.Key.Key_Space)
+    assert view.viewport().cursor().shape() == Qt.CursorShape.OpenHandCursor
+    assert scrolled_by(Qt.MouseButton.LeftButton, 10) == -10
+    QTest.keyRelease(view, Qt.Key.Key_Space)
+    assert view.viewport().cursor().shape() == Qt.CursorShape.CrossCursor
+    assert window.points == {}
+
+
+def test_control_clic_en_mac_mueve_y_no_borra_el_punto(window):
+    # macOS convierte Control + clic en clic derecho con el modificador Meta
+    view = window.view
+    click(window, 100, 200)
+    center = view.viewport().rect().center()
+    before = view.horizontalScrollBar().value()
+    drag(view.viewport(), Qt.MouseButton.RightButton, center, center + QPoint(30, 0),
+         Qt.KeyboardModifier.MetaModifier)
+    assert view.horizontalScrollBar().value() == before - 30
+    assert pixels(window.points) == {0: (100, 200)}
+
+
+def test_tras_arrastrar_el_clic_normal_sigue_marcando(window):
+    view = window.view
+    center = view.viewport().rect().center()
+    drag(view.viewport(), Qt.MouseButton.LeftButton, center, center + QPoint(30, 0),
+         Qt.KeyboardModifier.ControlModifier)
+    assert view.viewport().cursor().shape() == Qt.CursorShape.CrossCursor
+    click(window, 100, 200)
+    assert pixels(window.points) == {0: (100, 200)}
+    click(window, 100, 200, Qt.MouseButton.RightButton)
     assert window.points == {}
 
 
@@ -444,7 +813,7 @@ def test_cuatro_giros_dejan_todo_igual(window):
     click(window, 100, 200)
     for _ in range(4):
         window._rotate()
-    assert window.rotation == 0 and window.points[0] == (100, 200)
+    assert window.rotation == 0 and pixels(window.points)[0] == (100, 200)
     assert (window.width_field.value(), window.height_field.value()) == (WIDTH, HEIGHT)
 
 
@@ -481,7 +850,7 @@ def test_arrastrar_niveles_cambia_la_imagen_y_no_las_coordenadas(window):
     after = as_rgb(window.view._item.pixmap().toImage())
     assert after.mean() > before.mean()
     assert np.array_equal(window.reader.frame(0), raw)   # el vídeo original no se toca
-    assert window.points == {0: (100, 200)}
+    assert pixels(window.points) == {0: (100, 200)}
 
 
 def test_niveles_se_mantienen_al_cambiar_de_frame_y_se_restablecen(window):
@@ -504,7 +873,7 @@ def test_los_tiradores_no_se_cruzan(window):
     assert levels.white == 255 and levels.black == 255 - levels.MIN_RANGE
 
 
-# --------------------------------------------------------------------------- marcas
+# -------------------------------------------------------------------------- eventos
 
 def mark_points(win, *frames):
     for frame in frames:
@@ -512,86 +881,86 @@ def mark_points(win, *frames):
         click(win, 10 + frame, 20 + frame)
 
 
-def test_las_marcas_solo_se_activan_sobre_un_frame_con_punto(window):
-    first, last = window.tick_boxes
+def test_los_eventos_solo_se_marcan_sobre_un_frame_con_punto(window):
+    release, impact = window.tick_boxes
     go(window, 10)
-    assert not first.isEnabled() and not last.isEnabled()
+    assert not release.isEnabled() and not impact.isEnabled()
     click(window, 5, 5)
-    assert first.isEnabled() and last.isEnabled()
+    assert release.isEnabled() and impact.isEnabled()
 
 
-def test_cada_marca_una_sola_vez_y_nunca_en_el_mismo_frame(window):
-    first, last = window.tick_boxes
+def test_cada_evento_una_sola_vez_y_nunca_en_el_mismo_frame(window):
+    release, impact = window.tick_boxes
     mark_points(window, 10, 20, 30)
     go(window, 10)
-    tick_click(first)
+    tick_click(release)
     assert window.ticks == [10, None]
-    assert not last.isEnabled()
+    assert not impact.isEnabled()
 
     go(window, 20)
-    assert not first.isEnabled() and not first.isChecked()
-    assert last.isEnabled()
+    assert not release.isEnabled() and not release.isChecked()
+    assert impact.isEnabled()
     assert "10" in window.tick_jumps[0].text()
-    tick_click(last)
+    tick_click(impact)
     assert window.ticks == [10, 20]
 
     go(window, 30)
-    assert not first.isEnabled() and not last.isEnabled()
-    tick_click(first)
+    assert not release.isEnabled() and not impact.isEnabled()
+    tick_click(release)
     assert window.ticks == [10, 20]
 
 
-def test_el_primero_va_antes_que_el_ultimo(window):
-    first, last = window.tick_boxes
+def test_la_suelta_va_antes_que_el_impacto(window):
+    release, impact = window.tick_boxes
     mark_points(window, 10, 20)
-    tick_click(first)                       # primero en el 20
+    tick_click(release)                       # suelta en el 20
     go(window, 10)
-    assert not last.isEnabled()             # el último no puede ir antes
+    assert not impact.isEnabled()             # el impacto no puede ir antes
     go(window, 20)
-    tick_click(first)                       # se desmarca
-    tick_click(last)                        # último en el 20
+    tick_click(release)                       # se desmarca
+    tick_click(impact)                        # impacto en el 20
     go(window, 10)
-    assert first.isEnabled()
-    tick_click(first)
+    assert release.isEnabled()
+    tick_click(release)
     assert window.ticks == [10, 20]
 
 
-def test_quitar_el_punto_quita_su_marca(window):
-    first, last = window.tick_boxes
+def test_quitar_el_punto_quita_su_evento(window):
+    release, impact = window.tick_boxes
     mark_points(window, 10, 20)
-    tick_click(last)
+    tick_click(impact)
     assert window.ticks == [None, 20]
     click(window, 5, 5, Qt.MouseButton.RightButton)
     assert window.ticks == [None, None]
-    assert not last.isChecked()
+    assert not impact.isChecked()
 
 
-def test_mover_el_punto_conserva_su_marca(window):
+def test_mover_el_punto_conserva_su_evento(window):
     mark_points(window, 10)
     tick_click(window.tick_boxes[0])
     click(window, 50, 50)
-    assert window.ticks == [10, None] and window.points[10] == (50, 50)
+    assert window.ticks == [10, None] and pixels(window.points)[10] == (50, 50)
 
 
-def test_marca_se_corrige_desmarcando_en_su_frame(window):
-    first, last = window.tick_boxes
+def test_evento_se_corrige_desmarcando_en_su_frame(window):
+    release, impact = window.tick_boxes
     mark_points(window, 10, 20, 30)
     go(window, 10)
-    tick_click(first)
+    tick_click(release)
     go(window, 20)
-    tick_click(last)
+    tick_click(impact)
     go(window, 30)
     QTest.mouseClick(window.tick_jumps[1], Qt.MouseButton.LeftButton)
     pump()
-    assert window.frame == 20 and last.isChecked()
-    tick_click(last)
+    assert window.frame == 20 and impact.isChecked()
+    tick_click(impact)
     assert window.ticks == [10, None]
 
 
 # ------------------------------------------------------------------------ exportar
 
 def test_explica_que_se_guarda_en_la_carpeta_del_video(window):
-    assert window.export_note.text() == "Se guarda en la misma carpeta que el vídeo:"
+    assert window.export_note.text() == "Se guarda en la carpeta del vídeo:"
     folder = str(window.path.resolve().parent)
     assert window.folder_label.toolTip() == folder
     label = window.folder_label
@@ -611,12 +980,66 @@ def test_con_menos_de_dos_puntos_avisa_y_no_crea_archivo(window, dialogs, points
     assert not output.exists()
 
 
+def test_el_excel_lleva_la_posicion_exacta_con_dos_decimales(window):
+    view = window.view
+    position = view.mapFromScene(QPointF(100.3, 200.6))
+    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, position)
+    pump()
+    point = view.mapToScene(position)
+    mark_points(window, 1)
+    _, x, y, _ = sheet_rows(exported(window))[1]
+    assert (x, y) == pytest.approx((point.x(), point.y()), abs=0.011)
+    assert (x, y) == (round(x, 2), round(y, 2))
+    assert x != int(x) or y != int(y)
+
+
 def test_con_dos_puntos_ya_se_puede_exportar(window):
     mark_points(window, 0, 1)
     assert exported(window).exists()
 
 
-def test_exporta_cuatro_columnas_junto_al_video_con_su_nombre(window):
+def test_el_aviso_de_exportar_no_mueve_nada_de_la_ventana(window):
+    mark_points(window, 0, 1)
+    pump()
+    assert window.findChild(QStatusBar) is None
+    widgets = (window.view, window.slider, window.notice_label, window.hover_label, window.name_field)
+    before = [w.geometry() for w in widgets]
+    window._export()
+    pump()
+    assert window.notice_label.text() == "Exportado: disparo_01.xlsx"
+    assert [w.geometry() for w in widgets] == before
+    assert window.findChild(QStatusBar) is None
+    window._notice_timer.timeout.emit()      # al desaparecer tampoco
+    pump()
+    assert window.notice_label.text() == ""
+    assert [w.geometry() for w in widgets] == before
+
+
+def test_la_ventana_cabe_en_pantallas_pequenas(window):
+    # Un portátil de 1366 x 768 con barra de tareas deja unos 690 píxeles de alto
+    assert window.minimumSizeHint().height() < 600
+    window.resize(1000, 600)
+    pump()
+    assert window.height() <= 620
+    assert window.view.height() > 300
+    # El panel sigue siendo accesible, ahora con desplazamiento, y sin cortar el texto a lo ancho
+    panel = window.notice_label.parent()
+    area = panel.parent().parent()
+    assert area.verticalScrollBar().maximum() > 0
+    assert panel.width() == area.viewport().width()
+    assert panel.minimumSizeHint().width() <= panel.width()
+
+
+def test_un_aviso_largo_no_ensancha_el_panel(window):
+    panel_width = window.notice_label.parent().width()
+    window._notify("Exportado: " + "nombre_muy_largo_" * 20 + ".xlsx")
+    pump()
+    assert window.notice_label.parent().width() == panel_width
+    assert "…" in window.notice_label.text()
+    assert "nombre_muy_largo_" * 20 in window.notice_label.toolTip()
+
+
+def test_exporta_frame_posicion_y_evento_junto_al_video_con_su_nombre(window):
     for frame, (x, y) in {2: (50, 60), 0: (10, 20), 1: (30, 40)}.items():
         go(window, frame)
         click(window, x, y)
@@ -628,40 +1051,41 @@ def test_exporta_cuatro_columnas_junto_al_video_con_su_nombre(window):
     assert window.dirty
     output = exported(window)
     assert not window.dirty
-    assert sheet_rows(output) == [("frame", "x", "y", "marca"), (0, 10, 20, "primero"),
-                                  (1, 30, 40, None), (2, 50, 60, "último")]
+    rows = sheet_rows(output)
+    assert rows[0] == ("frame", "pixel x", "pixel y", "anotación")
+    assert [floored(row) for row in rows[1:]] == [(0, 10, 20, "suelta"), (1, 30, 40, None),
+                                                  (2, 50, 60, "impacto")]
     info = dict(sheet_rows(output, "Info"))
     assert info["FPS"] == pytest.approx(30)
     assert (info["Ancho"], info["Alto"]) == (WIDTH, HEIGHT)
-    assert (info["Primer frame"], info["Último frame"]) == (0, 2)
+    assert (info["Frame de suelta"], info["Frame de impacto"]) == (0, 2)
 
 
-@pytest.mark.parametrize("marked, marks, info_first, info_last", [
-    ((), (None, None, None), "no marcado", "no marcado"),            # no ve ninguno
-    ((0,), ("primero", None, None), 5, "no marcado"),                # no ve el último
-    ((1,), (None, None, "último"), "no marcado", 7),                 # no ve el primero
+@pytest.mark.parametrize("marked, events, info_release, info_impact", [
+    ((), (None, None, None), "no marcado", "no marcado"),            # no se ve ninguno
+    ((0,), ("suelta", None, None), 5, "no marcado"),                 # no se ve el impacto
+    ((1,), (None, None, "impacto"), "no marcado", 7),                # no se ve la suelta
 ])
-def test_una_camara_puede_no_ver_el_primero_o_el_ultimo(window, marked, marks, info_first, info_last):
+def test_un_video_puede_no_mostrar_la_suelta_o_el_impacto(window, marked, events, info_release, info_impact):
     mark_points(window, 5, 6, 7)
     for which in marked:
         go(window, 5 if which == 0 else 7)
         tick_click(window.tick_boxes[which])
     output = exported(window)
-    assert [row[3] for row in sheet_rows(output)[1:]] == list(marks)
+    assert [row[3] for row in sheet_rows(output)[1:]] == list(events)
     info = dict(sheet_rows(output, "Info"))
-    assert (info["Primer frame"], info["Último frame"]) == (info_first, info_last)
+    assert (info["Frame de suelta"], info["Frame de impacto"]) == (info_release, info_impact)
 
 
-def test_avisa_si_hay_puntos_fuera_de_las_marcas(window, dialogs):
-    mark_points(window, 5, 6, 7)
+def test_puede_haber_puntos_antes_de_la_suelta_y_despues_del_impacto(window, dialogs):
+    mark_points(window, 5, 6, 7, 8)
     go(window, 6)
-    tick_click(window.tick_boxes[0])        # primero en el 6, pero hay un punto en el 5
-    dialogs.answers[:] = [QMessageBox.StandardButton.No]
-    output = exported(window)
-    assert "antes del marcado" in dialogs.shown[-1]
-    assert not output.exists()
-    dialogs.answers[:] = [QMessageBox.StandardButton.Yes]
-    assert exported(window).exists()
+    tick_click(window.tick_boxes[0])
+    go(window, 7)
+    tick_click(window.tick_boxes[1])
+    output = exported(window)                # sin preguntar nada: la lista de respuestas está vacía
+    assert dialogs.shown == []
+    assert [row[3] for row in sheet_rows(output)[1:]] == [None, "suelta", "impacto", None]
 
 
 def test_nombre_elegido_por_el_usuario(window):
@@ -692,7 +1116,7 @@ def test_rutas_con_acentos_y_espacios(qapp, video, tmp_path, dialogs):
         mark_points(win, 0, 1)
         output = exported(win, "disparo número 1")
         assert output.parent == folder and output.exists()
-        assert sheet_rows(output)[0] == ("frame", "x", "y", "marca")
+        assert sheet_rows(output)[0] == ("frame", "pixel x", "pixel y", "anotación")
     finally:
         win.dirty = False
         win.close()
@@ -736,7 +1160,7 @@ def test_exporta_coordenadas_rotadas(window):
     click(window, 110, 210)
     window._rotate()
     output = exported(window)
-    assert sheet_rows(output)[1][:3] == (0, HEIGHT - 1 - 200, 100)
+    assert floored(sheet_rows(output)[1])[:3] == (0, HEIGHT - 1 - 200, 100)
     info = dict(sheet_rows(output, "Info"))
     assert (info["Ancho"], info["Alto"], info["Rotación (grados)"]) == (HEIGHT, WIDTH, 90)
 

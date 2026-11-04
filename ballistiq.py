@@ -3,7 +3,8 @@
 y exporta la tabla frame -> píxel a un Excel que queda junto al vídeo.
 
 Los frames se numeran desde 0. Las coordenadas son píxeles del vídeo tal como se
-ve (con la rotación y el ancho/alto indicados), con origen arriba a la izquierda.
+ve (con la rotación y el ancho/alto indicados), con dos decimales y con origen arriba a
+la izquierda: el píxel n va de n a n + 1.
 """
 
 import argparse
@@ -25,8 +26,9 @@ try:
     from PyQt6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QDoubleSpinBox,
                                  QFileDialog, QFormLayout, QFrame, QGraphicsScene, QGraphicsView,
                                  QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-                                 QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSlider,
-                                 QSpinBox, QStyle, QStyleOptionSlider, QVBoxLayout, QWidget)
+                                 QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSizePolicy,
+                                 QSlider, QSpinBox, QStyle, QStyleOptionButton, QStyleOptionSlider,
+                                 QVBoxLayout, QWidget)
 except ImportError as qt6_error:
     # Reserva para sistemas sin Qt6 que traen PyQt5 en sus propios paquetes.
     try:
@@ -36,13 +38,13 @@ except ImportError as qt6_error:
         from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QDoubleSpinBox,
                                      QFileDialog, QFormLayout, QFrame, QGraphicsScene, QGraphicsView,
                                      QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-                                     QMessageBox, QProgressDialog, QPushButton, QShortcut,
-                                     QSizePolicy, QSlider, QSpinBox, QStyle, QStyleOptionSlider,
-                                     QVBoxLayout, QWidget)
+                                     QMessageBox, QProgressDialog, QPushButton, QScrollArea, QShortcut,
+                                     QSizePolicy, QSlider, QSpinBox, QStyle, QStyleOptionButton,
+                                     QStyleOptionSlider, QVBoxLayout, QWidget)
     except ImportError:
         raise qt6_error
 
-__version__ = "1.1.0"
+__version__ = "1.4.0"
 
 PREDICTED_FRAMES = 5   # cuántos frames futuros se predicen
 FIT_POINTS = 5         # con cuántos puntos recientes se calcula la predicción
@@ -51,10 +53,13 @@ ZOOM_STEP = 1.25
 ZOOM_MIN, ZOOM_MAX = 0.02, 64.0
 MIN_EXPORT_POINTS = 2
 PANEL_WIDTH, PANEL_MARGIN = 270, 14
-FIRST, LAST = 0, 1     # posición de cada marca en MainWindow.ticks
+PANEL_TEXT_WIDTH = PANEL_WIDTH - 2 * PANEL_MARGIN - 20   # con sitio para su barra de desplazamiento
+NOTICE_MS = 10000      # cuánto se muestra un aviso, en milisegundos
+RELEASE, IMPACT = 0, 1     # posición de cada anotación en MainWindow.ticks
 
 POINT_COLOR = QColor("#ff3b30")
 PREDICTED_COLOR = QColor("#00d1ff")
+FIT_COLOR = QColor("#ffd60a")
 HALO_COLOR = QColor(0, 0, 0, 170)
 ACTIVE_RADIUS, PAST_RADIUS = 14, 5
 PREDICTED_MIN_GAP = 12  # separación mínima en pantalla entre círculos de predicción
@@ -63,12 +68,16 @@ VIDEO_FILTER = ("Vídeos (*.mp4 *.mov *.avi *.mkv *.m4v *.wmv *.mpg *.mpeg *.web
                 "*.MP4 *.MOV *.AVI *.MKV *.M4V *.WMV *.MPG *.MPEG *.WEBM);;"
                 "Todos los archivos (*)")
 INVALID_NAME_CHARS = '<>:"/\\|?*'
+PAN_KEYS = (Qt.Key.Key_Space, Qt.Key.Key_Control, Qt.Key.Key_Meta)   # con ellas, arrastrar mueve
+# En macOS, Qt llama Control a la tecla Command y Meta a la tecla Control.
+PAN_MODIFIERS = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
+PAN_KEY_NAME = "⌘ o Ctrl" if sys.platform == "darwin" else "Ctrl"
 FFMPEG_ERROR = getattr(av, "FFmpegError", av.error.FFmpegError)  # el nombre cambia según la versión
 
 STYLE = """
 #panel { background: #f5f5f7; border-left: 1px solid #d9d9de; }
 #navbar { background: #f5f5f7; border-top: 1px solid #d9d9de; }
-QLabel[role="title"] { color: #6e6e73; font-size: 11px; font-weight: 600; margin-top: 12px; }
+QLabel[role="title"] { color: #6e6e73; font-size: 11px; font-weight: 600; margin-top: 8px; }
 QLabel[role="hint"] { color: #6e6e73; font-size: 11px; }
 QLabel[role="warning"] { color: #b25000; font-size: 11px; }
 QPushButton#export { background: #0a84ff; color: white; font-weight: 600;
@@ -220,12 +229,32 @@ def predict(points, frame, last_frame):
     return result
 
 
+def fit_line(points, width, height):
+    """Recta que mejor se ajusta a todos los puntos, de borde a borde de la imagen.
+
+    Es un ajuste ortogonal: minimiza la distancia a la recta, no solo en la vertical, así
+    que vale para cualquier orientación, también para trayectorias verticales. Devuelve
+    sus dos extremos, o None si no hay al menos dos puntos distintos.
+    """
+    xy = np.array(list(points.values()), dtype=float).reshape(-1, 2)
+    if len(xy) < 2 or np.ptp(xy, axis=0).max() == 0:
+        return None
+    center = xy.mean(axis=0)
+    direction = np.linalg.svd(xy - center, full_matrices=False)[2][0]
+    t_min, t_max = -np.inf, np.inf
+    for c, d, size in zip(center, direction, (width, height)):
+        if abs(d) > 1e-12:
+            low, high = sorted(((0 - c) / d, (size - c) / d))
+            t_min, t_max = max(t_min, low), min(t_max, high)
+    return tuple(center + t_min * direction), tuple(center + t_max * direction)
+
+
 def write_excel(path, rows, info):
-    """Hoja "Puntos": frame, x, y, marca. Hoja "Info": datos con los que se midió."""
+    """Hoja "Puntos": frame, pixel x, pixel y, anotación. Hoja "Info": datos de la medida."""
     book = Workbook()
     sheet = book.active
     sheet.title = "Puntos"
-    sheet.append(["frame", "x", "y", "marca"])
+    sheet.append(["frame", "pixel x", "pixel y", "anotación"])
     for row in rows:
         sheet.append(list(row))
     sheet.freeze_panes = "A2"
@@ -237,9 +266,13 @@ def write_excel(path, rows, info):
     book.save(path)
 
 
+def _exact_pos(event):
+    """Posición del ratón con decimales: en pantallas de alta densidad hay fracciones de píxel."""
+    return event.position() if hasattr(event, "position") else event.localPos()   # Qt6 / Qt5
+
+
 def _event_pos(event):
-    """Posición del ratón: Qt6 usa position() y Qt5 pos()."""
-    return event.position().toPoint() if hasattr(event, "position") else event.pos()
+    return _exact_pos(event).toPoint()
 
 
 def _light_palette():
@@ -280,9 +313,10 @@ class VideoView(QGraphicsView):
     al hacer zoom o rotar: solo cambia la transformación de la vista.
     """
 
-    leftClicked = pyqtSignal(int, int)
+    leftClicked = pyqtSignal(float, float)
     rightClicked = pyqtSignal()
     zoomChanged = pyqtSignal(float)
+    hovered = pyqtSignal(object)   # punto de la imagen bajo el ratón, o None si está fuera
 
     def __init__(self, width, height):
         super().__init__()
@@ -291,20 +325,26 @@ class VideoView(QGraphicsView):
         self._stretch = (1.0, 1.0)
         self._zoom = 1.0
         self._fit_mode = True
+        self._image_rect = QRectF(0, 0, width, height)
         self._pan_from = None
-        self._space_held = False
-        self._points, self._frame, self._predicted = {}, 0, []
+        self._pan_keys = set()
+        self._zoom_anchor = None    # (posición en pantalla, punto de la imagen) del zoom en curso
+        self._points, self._frame, self._predicted, self._fit_line = {}, 0, [], None
+        self._show_guides = True
 
         self.setScene(QGraphicsScene(self))
         self._item = self.scene().addPixmap(QPixmap())
-        self.setSceneRect(QRectF(0, 0, width, height))
+        self.setSceneRect(self._image_rect)
         self.setBackgroundBrush(QColor("#1c1c1e"))
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        # La posición la lleva _apply_transform; se mueve arrastrando, sin barras.
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
         self.viewport().setCursor(Qt.CursorShape.CrossCursor)
 
     def set_image(self, image):
@@ -312,16 +352,28 @@ class VideoView(QGraphicsView):
         qimage = QImage(image.data, w, h, image.strides[0], QImage.Format.Format_RGB888)
         self._item.setPixmap(QPixmap.fromImage(qimage))
 
-    def set_overlay(self, points, frame, predicted):
-        self._points, self._frame, self._predicted = points, frame, predicted
+    def set_overlay(self, points, frame, predicted, line=None):
+        self._points, self._frame, self._predicted, self._fit_line = points, frame, predicted, line
+        self.viewport().update()
+
+    def set_guides_visible(self, visible):
+        self._show_guides = visible
         self.viewport().update()
 
     def set_geometry(self, rotation, stretch):
+        center = self._image_point_at(self._screen_center())
         self._rotation, self._stretch = rotation, stretch
+        self._zoom_anchor = None
         if self._fit_mode:
             self.fit()
         else:
-            self._apply_transform()
+            self._apply_transform(center)
+
+    def _screen_center(self):
+        return QRectF(self.viewport().rect()).center()
+
+    def _image_point_at(self, screen):
+        return self.viewportTransform().inverted()[0].map(QPointF(screen))
 
     def _base_transform(self):
         transform = QTransform()
@@ -329,43 +381,98 @@ class VideoView(QGraphicsView):
         transform.scale(*self._stretch)
         return transform
 
-    def _apply_transform(self):
-        self.setTransform(self._base_transform() * QTransform.fromScale(self._zoom, self._zoom))
+    def _apply_transform(self, fixed=None, screen=None):
+        """Aplica zoom y giro dejando el punto `fixed` de la imagen en `screen` de la pantalla.
+
+        Por defecto, el centro de la imagen en el centro de la pantalla.
+        """
+        transform = self._base_transform() * QTransform.fromScale(self._zoom, self._zoom)
+        self.setTransform(transform)
+        inverse = transform.inverted()[0]
+        # Con un margen de una pantalla, cualquier punto de la imagen puede estar bajo el
+        # cursor. Sin él, Qt la mantiene centrada mientras cabe y el zoom se aleja del cursor.
+        visible = inverse.mapRect(QRectF(self.viewport().rect()))
+        self.setSceneRect(self._image_rect.adjusted(-visible.width(), -visible.height(),
+                                                    visible.width(), visible.height()))
+        fixed = self._image_rect.center() if fixed is None else fixed
+        where = self._screen_center() if screen is None else QPointF(screen)
+        scroll = transform.map(fixed) - where
+        self.horizontalScrollBar().setValue(round(scroll.x()))
+        self.verticalScrollBar().setValue(round(scroll.y()))
         self._item.setTransformationMode(
             Qt.TransformationMode.SmoothTransformation if self._zoom < 1.5 else Qt.TransformationMode.FastTransformation)
         self.zoomChanged.emit(self._zoom)
 
     def fit(self):
         self._fit_mode = True
-        shown = self._base_transform().mapRect(self.sceneRect())
+        self._zoom_anchor = None
+        shown = self._base_transform().mapRect(self._image_rect)
         self._zoom = 0.99 * min(self.width() / shown.width(), self.height() / shown.height())
         self._apply_transform()
 
-    def zoom_by(self, factor):
+    def _anchored_point(self, screen):
+        """Punto de la imagen que hay en `screen`.
+
+        Mientras el zoom siga en el mismo sitio se usa siempre el mismo punto: medirlo en
+        cada paso acumularía el redondeo a píxeles y la imagen se iría desplazando.
+        """
+        screen = QPointF(screen)
+        if self._zoom_anchor is None or self._zoom_anchor[0] != screen:
+            self._zoom_anchor = (screen, self._image_point_at(screen))
+        return self._zoom_anchor[1]
+
+    def zoom_by(self, factor, screen=None):
+        """Cambia el zoom sin mover lo que hay en `screen`; por defecto, el centro de la pantalla."""
+        screen = self._screen_center() if screen is None else screen
+        fixed = self._anchored_point(screen)
         self._fit_mode = False
         self._zoom = min(max(self._zoom * factor, ZOOM_MIN), ZOOM_MAX)
-        self._apply_transform()
+        self._apply_transform(fixed, screen)
 
     def resizeEvent(self, event):
+        old = event.oldSize()
+        center = self._image_point_at(QPointF(old.width() / 2, old.height() / 2))
         super().resizeEvent(event)
+        self._zoom_anchor = None
         if self._fit_mode:
             self.fit()
+        else:
+            self._apply_transform(center)
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         if delta:
-            self.zoom_by(1.0015 ** delta)
+            self.zoom_by(1.0015 ** delta, _exact_pos(event))
+            self._report_hover(_exact_pos(event))
+
+    def _report_hover(self, screen):
+        point = self._image_point_at(screen)
+        self.hovered.emit(point if self._image_rect.contains(point) else None)
+
+    def leaveEvent(self, event):
+        self.hovered.emit(None)
+        super().leaveEvent(event)
+
+    def _is_pan_click(self, event):
+        button = event.button()
+        if button == Qt.MouseButton.MiddleButton:
+            return True
+        with_modifier = bool(event.modifiers() & PAN_MODIFIERS)
+        if button == Qt.MouseButton.LeftButton:
+            return with_modifier or Qt.Key.Key_Space in self._pan_keys
+        # macOS convierte Control + clic en clic derecho: aquí debe mover, no borrar el punto.
+        return button == Qt.MouseButton.RightButton and with_modifier
 
     def mousePressEvent(self, event):
         button = event.button()
-        if button == Qt.MouseButton.MiddleButton or (button == Qt.MouseButton.LeftButton and self._space_held):
+        if self._is_pan_click(event):
             self._pan_from = _event_pos(event)
+            self._zoom_anchor = None
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
         elif button == Qt.MouseButton.LeftButton:
-            p = self.mapToScene(_event_pos(event))
-            x, y = math.floor(p.x()), math.floor(p.y())
-            if 0 <= x < self._image_size[0] and 0 <= y < self._image_size[1]:
-                self.leftClicked.emit(x, y)
+            point = self._image_point_at(_exact_pos(event))
+            if self._image_rect.contains(point):
+                self.leftClicked.emit(point.x(), point.y())
         elif button == Qt.MouseButton.RightButton:
             self.rightClicked.emit()
 
@@ -378,6 +485,7 @@ class VideoView(QGraphicsView):
             self._pan_from = _event_pos(event)
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+        self._report_hover(_exact_pos(event))
 
     def mouseReleaseEvent(self, event):
         if self._pan_from is not None:
@@ -385,31 +493,32 @@ class VideoView(QGraphicsView):
             self._update_cursor()
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Space:
+        if event.key() in PAN_KEYS:
             if not event.isAutoRepeat():
-                self._space_held = True
+                self._pan_keys.add(event.key())
                 self._update_cursor()
         else:
             super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
-        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
-            self._space_held = False
+        if event.key() in PAN_KEYS and not event.isAutoRepeat():
+            self._pan_keys.discard(event.key())
             self._update_cursor()
 
     def focusOutEvent(self, event):
-        self._space_held = False
+        self._pan_keys.clear()
         self._update_cursor()
         super().focusOutEvent(event)
 
     def _update_cursor(self):
-        self.viewport().setCursor(Qt.CursorShape.OpenHandCursor if self._space_held else Qt.CursorShape.CrossCursor)
+        self.viewport().setCursor(Qt.CursorShape.OpenHandCursor if self._pan_keys
+                                  else Qt.CursorShape.CrossCursor)
 
     def drawForeground(self, painter, rect):
         to_view = self.viewportTransform().map
 
-        def center(x, y):  # centro del píxel, en coordenadas de pantalla
-            return to_view(QPointF(x + 0.5, y + 0.5))
+        def center(x, y):  # en coordenadas de pantalla
+            return to_view(QPointF(x, y))
 
         painter.save()
         painter.resetTransform()   # tamaño de las marcas fijo, sea cual sea el zoom
@@ -417,10 +526,13 @@ class VideoView(QGraphicsView):
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
         marked = sorted(self._points)
-        line = QPolygonF([center(*self._points[f]) for f in marked])
-        _stroked(painter, POINT_COLOR, 1.5, lambda: painter.drawPolyline(line))
-
-        self._draw_prediction(painter, center, marked)
+        if self._show_guides:
+            if self._fit_line:   # lo primero, para que quede al fondo
+                start, end = (to_view(QPointF(*p)) for p in self._fit_line)
+                _stroked(painter, FIT_COLOR, 1.2, lambda: painter.drawLine(start, end))
+            line = QPolygonF([center(*self._points[f]) for f in marked])
+            _stroked(painter, POINT_COLOR, 1.5, lambda: painter.drawPolyline(line))
+            self._draw_prediction(painter, center, marked)
 
         for f in marked:
             if f != self._frame:
@@ -542,6 +654,20 @@ class LevelsBar(QWidget):
             painter.drawPolygon(QPolygonF([QPointF(x, 12), QPointF(x - 6, 24), QPointF(x + 6, 24)]))
 
 
+class BoxedCheckBox(QCheckBox):
+    """Casilla con el borde bien visible: el de Fusion casi no se ve sobre un panel claro."""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        box = self.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, option, self)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#8e8e93" if self.isEnabled() else "#c7c7cc"), 1))
+        painter.drawRoundedRect(QRectF(box).adjusted(0.5, 0.5, -0.5, -0.5), 2, 2)
+
+
 class FrameSlider(QSlider):
     """Barra de frames: un clic en cualquier punto salta directamente ahí."""
 
@@ -564,8 +690,8 @@ class MainWindow(QMainWindow):
         self.path = Path(path)
         self.frame = 0
         self._target = 0
-        self.points = {}               # frame -> (x, y) en píxeles del vídeo original
-        self.ticks = [None, None]      # frame marcado como primero y como último
+        self.points = {}               # frame -> (x, y) exactos, en píxeles del vídeo original
+        self.ticks = [None, None]      # frame de la suelta y del impacto
         self.rotation = 0
         self.size_unrotated = (reader.width, reader.height)
         self.fps = reader.fps
@@ -573,12 +699,14 @@ class MainWindow(QMainWindow):
 
         self._nav_timer = QTimer(self, singleShot=True, interval=0)
         self._nav_timer.timeout.connect(self._show_target)
+        self._notice_timer = QTimer(self, singleShot=True, interval=NOTICE_MS)
 
         self.setWindowTitle(f"Ballistiq · {self.path.name}")
         self.view = VideoView(reader.width, reader.height)
         self.view.leftClicked.connect(self._on_left_click)
         self.view.rightClicked.connect(self._on_right_click)
         self.view.zoomChanged.connect(lambda z: self.zoom_label.setText(f"{z * 100:.0f} %"))
+        self.view.hovered.connect(self._on_hover)
 
         root = QWidget()
         layout = QGridLayout(root)
@@ -590,7 +718,8 @@ class MainWindow(QMainWindow):
         layout.setColumnStretch(0, 1)
         layout.setRowStretch(0, 1)
         self.setCentralWidget(root)
-        self.resize(1200, 760)
+        screen = QApplication.primaryScreen().availableSize()
+        self.resize(min(1200, screen.width()), min(760, screen.height() - 40))   # 40: barra de título
 
         for key, step in ((Qt.Key.Key_Left, -1), (Qt.Key.Key_Right, 1)):
             QShortcut(QKeySequence(key), self, lambda step=step: self.goto(self._target + step))
@@ -651,7 +780,6 @@ class MainWindow(QMainWindow):
 
     def _build_panel(self):
         panel = QWidget(objectName="panel")
-        panel.setFixedWidth(PANEL_WIDTH)
         column = QVBoxLayout(panel)
         column.setContentsMargins(PANEL_MARGIN, 6, PANEL_MARGIN, PANEL_MARGIN)
         column.setSpacing(6)
@@ -685,14 +813,24 @@ class MainWindow(QMainWindow):
         self.rotate_button = self._button("Rotar 90°", self._rotate)
         column.addWidget(self.rotate_button)
         zoom_row = QHBoxLayout()
-        zoom_row.addWidget(self._button("−", lambda: self.view.zoom_by(1 / ZOOM_STEP)))
-        zoom_row.addWidget(self._button("+", lambda: self.view.zoom_by(ZOOM_STEP)))
-        zoom_row.addWidget(self._button("Ajustar", self.view.fit))
+        for text, action in (("−", lambda: self.view.zoom_by(1 / ZOOM_STEP)),
+                             ("+", lambda: self.view.zoom_by(ZOOM_STEP)),
+                             ("Ajustar", self.view.fit)):
+            button = self._button(text, action)
+            button.setMinimumWidth(30)   # el mínimo del estilo Fusion, 80, no cabría en el panel
+            zoom_row.addWidget(button)
         self.zoom_label = QLabel("100 %")
         self.zoom_label.setMinimumWidth(46)
         self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         zoom_row.addWidget(self.zoom_label)
         column.addLayout(zoom_row)
+        self.guides_box = BoxedCheckBox("Mostrar líneas guía")
+        self.guides_box.setChecked(True)
+        self.guides_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.guides_box.setToolTip("Línea roja entre puntos, recta de ajuste amarilla y predicción "
+                                   "azul. Los puntos se ven siempre.")
+        self.guides_box.toggled.connect(self.view.set_guides_visible)
+        column.addWidget(self.guides_box)
 
         title("Niveles")
         self.levels = LevelsBar()
@@ -708,13 +846,13 @@ class MainWindow(QMainWindow):
         levels_row.addWidget(levels_reset)
         column.addLayout(levels_row)
 
-        title("Marcas de frame")
+        title("Anotaciones")
         self.tick_boxes, self.tick_jumps = [], []
-        for which, text in enumerate(("Primer frame", "Último frame")):
-            box = QCheckBox(text)
+        for which, (text, event) in enumerate((("Suelta", "la suelta"), ("Impacto", "el impacto"))):
+            box = BoxedCheckBox(text)
             box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            box.setToolTip(f"Marca el punto de este frame como el {text.split()[0].lower()} de la "
-                           "trayectoria. Déjalo sin marcar si esta cámara no lo ve.")
+            box.setToolTip(f"Marca el punto de este frame como {event}. "
+                           "Déjalo sin marcar si no se ve en este vídeo.")
             box.toggled.connect(lambda checked, which=which: self._on_tick(which, checked))
             jump = self._button("", lambda _=False, which=which: self.goto(self.ticks[which]))
             jump.setProperty("role", "link")
@@ -728,6 +866,9 @@ class MainWindow(QMainWindow):
             self.tick_jumps.append(jump)
 
         title("Puntos")
+        self.hover_label = QLabel()
+        self._on_hover(None)
+        column.addWidget(self.hover_label)
         self.point_label = QLabel()
         self.count_label = QLabel()
         column.addWidget(self.point_label)
@@ -741,32 +882,50 @@ class MainWindow(QMainWindow):
         name_row.addWidget(self.name_field, 1)
         name_row.addWidget(QLabel(".xlsx"))
         column.addLayout(name_row)
-        self.export_note = QLabel("Se guarda en la misma carpeta que el vídeo:")
+        self.export_note = QLabel("Se guarda en la carpeta del vídeo:")
         self.export_note.setProperty("role", "hint")
-        self.export_note.setWordWrap(True)
         column.addWidget(self.export_note)
         folder = str(self.path.resolve().parent)
         self.folder_label = QLabel()
         self.folder_label.setProperty("role", "hint")
         self.folder_label.setToolTip(folder)
+        self.folder_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.folder_label.ensurePolished()   # para medir el texto con su tamaño real
         self.folder_label.setText(self.folder_label.fontMetrics().elidedText(
-            folder, Qt.TextElideMode.ElideMiddle, PANEL_WIDTH - 2 * PANEL_MARGIN))
+            folder, Qt.TextElideMode.ElideMiddle, PANEL_TEXT_WIDTH))
         column.addWidget(self.folder_label)
         export_button = self._button("Exportar a Excel", self._export)
         export_button.setObjectName("export")
         column.addWidget(export_button)
+        # Con su hueco reservado siempre, para que un aviso no mueva nada de la ventana.
+        self.notice_label = QLabel()
+        self.notice_label.setProperty("role", "hint")
+        self.notice_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.notice_label.ensurePolished()
+        self.notice_label.setFixedHeight(self.notice_label.fontMetrics().height() + 2)
+        self._notice_timer.timeout.connect(self.notice_label.clear)
+        column.addWidget(self.notice_label)
 
         column.addStretch(1)
         hint = QLabel("Clic izquierdo: poner punto\n"
-                      "Clic derecho: quitar el punto de este frame\n"
+                      "Clic derecho: quitar el punto\n"
                       "← →: frame anterior / siguiente\n"
-                      "Rueda: zoom\n"
-                      "Espacio + arrastrar: mover la imagen")
+                      "Rueda: zoom hacia el cursor\n"
+                      "Rueda pulsada + arrastrar: mover\n"
+                      f"{PAN_KEY_NAME} + arrastrar: mover")
         hint.setProperty("role", "hint")
         hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         column.addWidget(hint)
-        return panel
+
+        # Dentro de un área con desplazamiento, para que la ventana quepa en pantallas pequeñas.
+        area = QScrollArea()
+        area.setWidget(panel)
+        area.setWidgetResizable(True)
+        area.setFixedWidth(PANEL_WIDTH)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        return area
 
     # ------------------------------------------------------------- navegación
 
@@ -779,7 +938,7 @@ class MainWindow(QMainWindow):
     def _show_target(self):
         image = self.reader.frame(self._target)
         if image is None:
-            self.statusBar().showMessage(f"No se pudo leer el frame {self._target}", 6000)
+            self._notify(f"No se pudo leer el frame {self._target}")
             self._target = self.frame
         else:
             self.frame = self._target
@@ -806,15 +965,30 @@ class MainWindow(QMainWindow):
 
         if self.frame in self.points:
             x, y = self._output_xy(*self.points[self.frame])
-            self.point_label.setText(f"Este frame: x = {x}, y = {y}")
+            self.point_label.setText(f"Este frame: x = {x:.2f}, y = {y:.2f}")
         else:
             self.point_label.setText("Este frame: sin punto")
         self.count_label.setText(f"Marcados: {len(self.points)}")
 
         predicted = predict(self.points, self.frame, self.reader.count - 1)
-        self.view.set_overlay(self.points, self.frame, predicted)
+        line = fit_line(self.points, self.reader.width, self.reader.height)
+        self.view.set_overlay(self.points, self.frame, predicted, line)
 
-    # ------------------------------------------------------- puntos y marcas
+    def _notify(self, text):
+        label = self.notice_label
+        label.setText(label.fontMetrics().elidedText(text, Qt.TextElideMode.ElideMiddle,
+                                                     PANEL_TEXT_WIDTH))
+        label.setToolTip(text)
+        self._notice_timer.start()
+
+    def _on_hover(self, point):
+        if point is None:
+            self.hover_label.setText("Ratón: fuera de la imagen")
+        else:
+            x, y = self._output_xy(point.x(), point.y())
+            self.hover_label.setText(f"Ratón: x = {x:.2f}, y = {y:.2f}")
+
+    # --------------------------------------------------- puntos y anotaciones
 
     def _on_left_click(self, x, y):
         self.points[self.frame] = (x, y)
@@ -828,7 +1002,7 @@ class MainWindow(QMainWindow):
             self._refresh()
 
     def _tick_available(self, which):
-        """Cada marca va sobre un punto, una sola vez, y el primero antes que el último."""
+        """Cada anotación va sobre un punto, una sola vez, y la suelta antes que el impacto."""
         mine, other = self.ticks[which], self.ticks[1 - which]
         if mine == self.frame:
             return True
@@ -836,7 +1010,7 @@ class MainWindow(QMainWindow):
             return False
         if other is None:
             return True
-        return self.frame < other if which == FIRST else self.frame > other
+        return self.frame < other if which == RELEASE else self.frame > other
 
     def _on_tick(self, which, checked):
         self.ticks[which] = self.frame if checked else None
@@ -875,17 +1049,16 @@ class MainWindow(QMainWindow):
         self._refresh()
 
     def _output_xy(self, x, y):
-        """Pasa de píxel del vídeo original a píxel del vídeo tal como se ve."""
+        """Pasa de un punto del vídeo original a coordenadas del vídeo tal como se ve."""
         w, h = self.size_unrotated
-        px = math.floor((x + 0.5) * w / self.reader.width)
-        py = math.floor((y + 0.5) * h / self.reader.height)
+        x, y = x * w / self.reader.width, y * h / self.reader.height
         if self.rotation == 90:
-            return h - 1 - py, px
-        if self.rotation == 180:
-            return w - 1 - px, h - 1 - py
-        if self.rotation == 270:
-            return py, w - 1 - px
-        return px, py
+            x, y = h - y, x
+        elif self.rotation == 180:
+            x, y = w - x, h - y
+        elif self.rotation == 270:
+            x, y = y, w - x
+        return round(x, 2), round(y, 2)
 
     # ---------------------------------------------------------------- exportar
 
@@ -895,14 +1068,6 @@ class MainWindow(QMainWindow):
                                     f"Hacen falta al menos {MIN_EXPORT_POINTS} puntos para exportar "
                                     f"(ahora hay {len(self.points)}).")
             return
-        first, last = self.ticks
-        if ((first is not None and min(self.points) < first)
-                or (last is not None and max(self.points) > last)):
-            answer = QMessageBox.question(self, "Exportar",
-                                          "Hay puntos antes del marcado como primero o después del "
-                                          "marcado como último. ¿Exportar de todos modos?")
-            if answer != QMessageBox.StandardButton.Yes:
-                return
         name = self.name_field.text().strip()
         if name.lower().endswith(".xlsx"):
             name = name[:-5]
@@ -920,8 +1085,9 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
-        marks = {first: "primero", last: "último"}
-        rows = [(f, *self._output_xy(*self.points[f]), marks.get(f)) for f in sorted(self.points)]
+        release, impact = self.ticks
+        events = {release: "suelta", impact: "impacto"}
+        rows = [(f, *self._output_xy(*self.points[f]), events.get(f)) for f in sorted(self.points)]
         width, height = self._shown_size()
         info = [("Vídeo", self.path.name),
                 ("FPS", self.fps),
@@ -929,10 +1095,11 @@ class MainWindow(QMainWindow):
                 ("Ancho", width),
                 ("Alto", height),
                 ("Rotación (grados)", self.rotation),
-                ("Primer frame", "no marcado" if first is None else first),
-                ("Último frame", "no marcado" if last is None else last),
+                ("Frame de suelta", "no marcado" if release is None else release),
+                ("Frame de impacto", "no marcado" if impact is None else impact),
                 ("Frames del vídeo", self.reader.count),
-                ("Coordenadas", "píxeles; origen arriba a la izquierda, y hacia abajo")]
+                ("Coordenadas", "píxeles con decimales; origen arriba a la izquierda, y hacia abajo; "
+                                "el píxel n va de n a n + 1")]
         try:
             write_excel(target, rows, info)
         except OSError as error:
@@ -941,7 +1108,7 @@ class MainWindow(QMainWindow):
                                  f"¿Está abierto en Excel?\n\n{error}")
             return
         self.dirty = False
-        self.statusBar().showMessage(f"Exportados {len(rows)} puntos a {target}", 10000)
+        self._notify(f"Exportado: {target.name}")
 
     def closeEvent(self, event):
         if self.dirty:
@@ -951,6 +1118,12 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         event.accept()
+
+
+def apply_style(app):
+    app.setStyle("Fusion")
+    app.setPalette(_light_palette())
+    app.setStyleSheet(STYLE)
 
 
 def open_reader(path):
@@ -983,9 +1156,7 @@ def main():
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling)
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setPalette(_light_palette())
-    app.setStyleSheet(STYLE)
+    apply_style(app)
 
     reader = None
     while reader is None:

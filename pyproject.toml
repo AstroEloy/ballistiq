@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ballistiq"
-version = "1.1.0"
+version = "1.4.0"
 description = "Marca un objeto frame a frame en un vídeo y exporta sus píxeles a Excel."
 readme = "README.md"
 requires-python = ">=3.8,<3.15"

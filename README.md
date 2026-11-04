@@ -44,8 +44,8 @@ ballistiq disparo.mp4  # abre ese vídeo
 | Quitar el punto del frame | Clic derecho |
 | Frame anterior / siguiente | `←` `→` |
 | Ir a cualquier frame | Barra inferior, o escribir el número |
-| Zoom | Rueda del ratón, o botones `−` `+` |
-| Mover la imagen con zoom | Botón central, o `Espacio` + arrastrar |
+| Zoom hacia el cursor | Rueda del ratón (botones `−` `+`: hacia el centro) |
+| Mover la imagen | Arrastrar con la rueda pulsada, o con `Ctrl`, `⌘` o `Espacio` + clic izquierdo |
 | Rotar 90° | Botón **Rotar 90°** |
 | Ver mejor el objeto | Barra de **Niveles** (doble clic para restablecer) |
 
@@ -53,18 +53,29 @@ Cada frame admite un solo punto, y solo se edita el del frame en el que estás. 
 pasar de frame, el punto se hace más pequeño y queda fijo; si vuelves a su frame,
 puedes cambiarlo. El zoom, la rotación y los niveles se mantienen al cambiar de frame.
 
-**Trayectoria y predicción.** Los puntos se unen con líneas rectas y, en azul, se
+**Trayectoria y predicción.** Los puntos se unen con líneas rectas en rojo y, en azul, se
 dibuja dónde se espera el objeto en los 5 frames siguientes. La predicción es una recta
 ajustada a los últimos 5 puntos y tiene en cuenta los frames que te hayas saltado.
 
-**Primer y último frame.** Marca el punto donde el objeto aparece por primera vez y
-donde se ve por última vez. Son opcionales, porque una cámara puede no ver el primero,
-el último o ninguno de los dos: en ese caso, deja esa marca sin activar.
+**Recta de ajuste.** Al fondo, en amarillo, se dibuja de borde a borde de la imagen una
+única recta ajustada a todos los puntos. Se calcula minimizando la distancia a la recta,
+así que sirve para cualquier orientación de la trayectoria.
 
-- Cada marca se activa una sola vez y va sobre un frame que ya tenga punto.
-- El primero siempre va antes que el último.
-- Si quitas el punto, se quita también su marca.
-- Para corregir una marca, ve a su frame (el enlace `→` te lleva) y desmárcala.
+**Líneas guía.** La casilla *Mostrar líneas guía* oculta la línea roja, la recta de ajuste
+y la predicción. Los puntos marcados se siguen viendo y lo que se exporta no cambia.
+
+**Posición del ratón.** El panel muestra la `x` y la `y` del ratón con decimales, en las
+mismas coordenadas que se exportan: el punto que marques ahí se exporta con ese valor.
+
+**Suelta e impacto.** Marca el frame en el que se ve la suelta y el frame en el que se ve
+el impacto. Son opcionales, porque un vídeo puede no mostrar la suelta, el impacto o
+ninguno de los dos: en ese caso, deja esa casilla sin activar.
+
+- Cada anotación se marca una sola vez y va sobre un frame que ya tenga punto.
+- La suelta siempre va antes que el impacto.
+- Puede haber puntos antes de la suelta y después del impacto.
+- Si quitas el punto, se quita también su anotación.
+- Para corregir una anotación, ve a su frame (el enlace `→` te lleva) y desmárcala.
 
 **FPS, ancho y alto** se leen del vídeo, y se pueden cambiar si no son correctos. El
 FPS afecta al tiempo mostrado. El ancho y el alto reescalan la imagen y las coordenadas
@@ -80,23 +91,24 @@ de reemplazarlo.
 
 La hoja **Puntos** tiene una fila por punto:
 
-| frame | x | y | marca |
+| frame | pixel x | pixel y | anotación |
 | --- | --- | --- | --- |
-| 60 | 176 | 602 | primero |
-| 61 | 178 | 601 | |
-| 62 | 180 | 600 | último |
+| 60 | 176.25 | 602.40 | suelta |
+| 61 | 178.60 | 601.15 | |
+| 62 | 180.85 | 600.05 | impacto |
 
-La columna `marca` queda vacía en las demás filas. Si la cámara no vio el primero o el
-último, ninguna fila lleva esa palabra.
+La columna `anotación` queda en blanco en las demás filas. Si el vídeo no muestra la
+suelta o el impacto, ninguna fila lleva esa palabra.
 
 La hoja **Info** guarda los datos de la medida: vídeo, FPS, ancho, alto, rotación y los
-frames marcados como primero y último.
+frames de suelta e impacto.
 
 Cómo leer los valores:
 
 - Los frames se numeran **desde 0**.
-- Las coordenadas son **píxeles enteros**, con origen en la esquina superior izquierda
-  y la `y` hacia abajo.
+- Las coordenadas son **píxeles con dos decimales**, con origen en la esquina superior
+  izquierda y la `y` hacia abajo. El píxel `n` va de `n` a `n + 1`, así que su centro es
+  `n + 0.5`.
 - Corresponden al vídeo **tal como se ve**: dependen de la rotación y del ancho y alto
   indicados. Los niveles no les afectan, porque solo cambian cómo se ve la imagen.
 

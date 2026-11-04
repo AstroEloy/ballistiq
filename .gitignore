@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.DS_Store
+
+# Datos de trabajo: los vídeos y los Excel exportados no van al repositorio
+*.xlsx
+*.mp4
+*.mov
+*.avi
+*.mkv

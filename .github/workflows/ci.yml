@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 1 * *"   # una vez al mes: avisa si algo deja de instalarse
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # En un repositorio privado los minutos son limitados (Windows gasta el doble y
+        # macOS diez veces más), así que se prioriza Linux y Windows.
+        include:
+          - {os: ubuntu-latest, python: "3.8"}
+          - {os: ubuntu-latest, python: "3.12"}
+          - {os: ubuntu-latest, python: "3.14"}
+          - {os: ubuntu-24.04-arm, python: "3.12"}
+          - {os: windows-latest, python: "3.8"}
+          - {os: windows-latest, python: "3.12"}
+          - {os: windows-latest, python: "3.14"}
+          - {os: windows-11-arm, python: "3.12"}
+          - {os: macos-latest, python: "3.14"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Librerías del sistema que Qt necesita en Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $(python -c "import install; print(' '.join(install.LINUX_LIBRARIES))")
+      - name: Instalador
+        run: python install.py
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Pruebas
+        run: |
+          python -m pip install --only-binary=:all: ".[test]"
+          python -m pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
